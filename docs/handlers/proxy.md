@@ -23,12 +23,6 @@ endpoint), labeled by `upstream`:
 
 The handler has the following optional fields:
 
-- `half_close_timeout` may specify how long to wait for the other side of a connection once one side has finished
-  sending (a half-closed connection) while nothing is received from it. Every read restarts the wait, so data still
-  flowing in the other direction is never cut; when the wait elapses, the connection is closed. By default, it equals
-  `0`, and the handler waits until the other side finishes, however long it takes. It is similar to HAProxy's
-  `timeout client-fin` and `timeout server-fin`.
-
 - `health_checks` may contain a `l4proxy.HealthChecks` structure which includes `active` (`l4proxy.ActiveHealthChecks`)
   and `passive` (`l4proxy.PassiveHealthChecks`) fields (valid for JSON). In a Caddyfile, multiple options are used to
   fill these structures as described below.
@@ -137,10 +131,10 @@ Each `upstream` has the following fields:
 - `transparent` enables Linux transparent proxying for this upstream. Caddy configures the outbound socket
   with `IP_TRANSPARENT` (or `IPV6_TRANSPARENT`) and binds it to the effective downstream client's IP address,
   including an address supplied by the PROXY protocol handler. The source port is chosen by the OS. This
-  option is supported only on Linux and requires `CAP_NET_ADMIN` or equivalent privileges, plus policy routing
-  that returns the upstream's replies through the Caddy host. The upstream must be reachable over the same IP
-  family as the client. `transparent` cannot be combined with `local_address` or `resolver_preference`, and
-  it is not supported for Unix socket upstreams.
+  option is supported only on Linux and requires `CAP_NET_ADMIN`, `CAP_NET_RAW`, or equivalent privileges,
+  plus policy routing that returns the upstream's replies through the Caddy host. The upstream must be reachable
+  over the same IP family as the client. `transparent` cannot be combined with `local_address` or
+  `resolver_preference`, and it is not supported for Unix socket upstreams.
 
 - `resolver_preference` optionally controls address-family preference when resolving upstream hostnames. It must be
   exactly one of: `ipv4_only`, `ipv6_only`, `ipv4_first` (default), `ipv6_first`. Any other value, including
@@ -213,7 +207,6 @@ proxy [<upstreams...>] {
     lb_try_duration <duration>
     lb_try_interval <duration>
     
-    half_close_timeout <duration>
     proxy_protocol <v1|v2>
     
     # multiple upstream options are supported
@@ -315,7 +308,6 @@ filled at random:
                     lb_policy round_robin
                     lb_try_duration 5s
                     lb_try_interval 15s
-                    half_close_timeout 30s
                     proxy_protocol v2
                     upstream 10.0.0.1:8080
                     upstream 10.0.0.2:8080 10.0.0.2:8888
@@ -361,7 +353,6 @@ JSON equivalent to the caddyfile config provided above:
                         {
                             "handle": [
                                 {
-                                    "half_close_timeout": 30000000000,
                                     "handler": "proxy",
                                     "health_checks": {
                                         "active": {
@@ -582,6 +573,33 @@ On Linux, `transparent` makes the upstream connection originate from the effecti
 }
 ```
 
-The Caddy process needs `CAP_NET_ADMIN` (or equivalent privileges). The host also needs transparent-proxy
-policy routing so replies from `10.0.0.2` return through Caddy instead of going directly to the client. This
-option preserves the source IP only; the kernel chooses a source port for the upstream connection.
+The Caddy process needs `CAP_NET_ADMIN`, `CAP_NET_RAW`, or equivalent privileges. The upstream must route the
+client address range back through Caddy's upstream-facing address. For example, if clients are in
+`192.0.2.0/24` and Caddy is `10.0.0.1` on the upstream network, configure this route on the upstream or its
+gateway:
+
+```sh
+ip route add 192.0.2.0/24 via 10.0.0.1
+```
+
+Caddy's host must then deliver matching replies to the transparent socket instead of forwarding them as ordinary
+traffic. One IPv4 `iptables` policy-routing setup is:
+
+```sh
+iptables -t mangle -N CADDY_DIVERT
+iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j CADDY_DIVERT
+iptables -t mangle -A PREROUTING -p udp -m socket --transparent -j CADDY_DIVERT
+iptables -t mangle -A CADDY_DIVERT -j MARK --set-mark 1
+iptables -t mangle -A CADDY_DIVERT -j ACCEPT
+
+ip rule add fwmark 1 lookup 100
+ip route add local 0.0.0.0/0 dev lo table 100
+```
+
+Restrict the rules to the upstream-facing interface where appropriate, and make sure the firewall permits the
+return traffic. IPv6 deployments need equivalent `ip6tables` rules, an IPv6 policy rule and a local `::/0` route.
+The exact commands depend on the host's existing firewall and routing tables; the kernel's
+[transparent proxy documentation](https://docs.kernel.org/networking/tproxy.html) describes the underlying
+socket-match and policy-routing mechanism.
+
+This option preserves the source IP only; the kernel chooses a source port for the upstream connection.
