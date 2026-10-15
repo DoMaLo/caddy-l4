@@ -49,6 +49,7 @@ Matchers are categorized into different types based on their function:
 |                  | [**quic**](/docs/matchers/quic.md)                     | Looking like [QUIC](https://quic.xargs.org/)                                                                               |
 |                  | [**rdp**](/docs/matchers/rdp.md)                       | Looking like [RDP](https://winprotocoldoc.blob.core.windows.net/productionwindowsarchives/MS-RDPBCGR/%5BMS-RDPBCGR%5D.pdf) |
 |                  | [**regexp**](/docs/matchers/regexp.md)                 | Satisfying a regular expression                                                                                            |
+|                  | [**rtsp**](/docs/matchers/rtsp.md)                     | Starting with [RTSP](https://datatracker.ietf.org/doc/html/rfc2326) requests (optionally by Host)                          |
 |                  | [**socks4**](/docs/matchers/socks4.md)                 | Looking like [SOCKSv4](https://www.openssh.com/txt/socks4.protocol)                                                        |
 |                  | [**socks5**](/docs/matchers/socks5.md)                 | Looking like [SOCKSv5](https://www.rfc-editor.org/rfc/rfc1928)                                                             |
 |                  | [**ssh**](/docs/matchers/ssh.md)                       | Looking like [SSH](https://www.rfc-editor.org/rfc/rfc4253)                                                                 |
