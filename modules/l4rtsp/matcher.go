@@ -32,10 +32,16 @@ func init() {
 
 // MatchRTSP matches RTSP (over TCP) connections by inspecting the first request.
 //
+// Matching always waits until the end of the request headers (\r\n\r\n or \n\n)
+// before deciding. That way a Host header can override the authority in an
+// absolute rtsp:// URI, truncated header lines are not treated as complete, and
+// a bare `rtsp` catch-all does not match before host-specific routes that are
+// still waiting for more bytes.
+//
 // With no Host filters configured, any well-formed RTSP request matches.
 // With Host filters, the connection matches when the request Host header or
-// the authority in an absolute rtsp:// URI equals one of the configured names
-// (exact or *.suffix wildcards, case-insensitive).
+// (if absent) the authority in an absolute rtsp:// URI equals one of the
+// configured names (exact or *.suffix wildcards, case-insensitive).
 type MatchRTSP struct {
 	// Host is a list of hostnames to match. Empty means any RTSP host.
 	Host []string `json:"host,omitempty"`
@@ -57,7 +63,7 @@ func (m *MatchRTSP) Match(cx *layer4.Connection) (bool, error) {
 	}
 
 	data := cx.MatchingBytes()
-	needMore, isRTSP, host := parseRTSP(data, len(m.Host) > 0)
+	needMore, isRTSP, host := parseRTSP(data)
 	if needMore {
 		if len(data) >= layer4.MaxMatchingBytes {
 			return false, layer4.ErrMatchingBufferFull
@@ -104,7 +110,7 @@ func (m *MatchRTSP) hostMatches(host string) bool {
 
 // parseRTSP inspects prefetched bytes.
 // needMore is true when more data is required to decide.
-func parseRTSP(data []byte, needHost bool) (needMore, isRTSP bool, host string) {
+func parseRTSP(data []byte) (needMore, isRTSP bool, host string) {
 	lineEnd := bytes.IndexByte(data, '\n')
 	if lineEnd < 0 {
 		return true, false, ""
@@ -132,19 +138,23 @@ func parseRTSP(data []byte, needHost bool) (needMore, isRTSP bool, host string) 
 		return false, false, ""
 	}
 
-	isRTSP = true
-	host = hostFromAbsoluteURI(string(uri))
-
+	// Always wait for the end of headers before a final decision. This lets
+	// Host override the URI authority, avoids accepting truncated header lines,
+	// and keeps bare `rtsp` catch-alls from matching while host routes prefetch.
 	headers := data[lineEnd+1:]
-	headersDone := bytes.Contains(headers, []byte("\r\n\r\n")) || bytes.Contains(headers, []byte("\n\n"))
-	if h, found := headerValue(headers, "host"); found {
-		host = h
-	} else if needHost && host == "" && !headersDone {
-		// Waiting for Host header (or end of headers proving there is none).
+	if !headersComplete(headers) {
 		return true, true, ""
 	}
 
+	host = hostFromAbsoluteURI(string(uri))
+	if h, found := headerValue(headers, "host"); found {
+		host = h
+	}
 	return false, true, host
+}
+
+func headersComplete(headers []byte) bool {
+	return bytes.Contains(headers, []byte("\r\n\r\n")) || bytes.Contains(headers, []byte("\n\n"))
 }
 
 func hostFromAbsoluteURI(raw string) string {
@@ -158,18 +168,18 @@ func hostFromAbsoluteURI(raw string) string {
 	return u.Host
 }
 
+// headerValue returns the value of the named header. Only complete lines
+// (terminated by \n) are considered; a trailing unterminated fragment is ignored.
 func headerValue(headers []byte, name string) (string, bool) {
 	name = strings.ToLower(name)
 	for len(headers) > 0 {
 		eol := bytes.IndexByte(headers, '\n')
-		var line []byte
 		if eol < 0 {
-			line = headers
-			headers = nil
-		} else {
-			line = headers[:eol]
-			headers = headers[eol+1:]
+			// Incomplete trailing line — not a finished header.
+			return "", false
 		}
+		line := headers[:eol]
+		headers = headers[eol+1:]
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}

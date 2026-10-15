@@ -83,7 +83,13 @@ Example — route cameras by host on TCP port 554:
 
 ## Notes
 
+- Matching always waits for the end of request headers (`\r\n\r\n` or `\n\n`)
+  before deciding. The `Host` header overrides the authority of an absolute
+  `rtsp://` URI when both are present. This also keeps a bare `rtsp` catch-all
+  from matching while host-specific routes are still prefetching headers.
 - Only the first request of the TCP connection is inspected (matching buffer).
 - Host matching is case-insensitive; ports in `Host` / URI authority are ignored.
-- Wildcard form `*.example.com` matches `example.com` and any subdomain.
+- Wildcard form `*.example.com` matches `example.com` and any subdomain
+  (`HasSuffix`); it does not match names like `foo.example.com.bar`.
+- Method filtering is not supported; any valid RTSP request line is accepted.
 - Interleaved RTP/RTCP over the same TCP connection is proxied after matching; the matcher does not parse media frames.

@@ -1,0 +1,100 @@
+{
+	layer4 {
+		:554 {
+			@cam1 rtsp host cam1.example.com
+			route @cam1 {
+				proxy 10.0.0.10:554
+			}
+			@cam2 rtsp host cam2.example.com *.labs.local
+			route @cam2 {
+				proxy 10.0.0.20:554
+			}
+			@any rtsp
+			route @any {
+				proxy 10.0.0.99:554
+			}
+		}
+	}
+}
+----------
+{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":554"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"rtsp": {
+										"host": [
+											"cam1.example.com"
+										]
+									}
+								}
+							],
+							"handle": [
+								{
+									"handler": "proxy",
+									"upstreams": [
+										{
+											"dial": [
+												"10.0.0.10:554"
+											]
+										}
+									]
+								}
+							]
+						},
+						{
+							"match": [
+								{
+									"rtsp": {
+										"host": [
+											"cam2.example.com",
+											"*.labs.local"
+										]
+									}
+								}
+							],
+							"handle": [
+								{
+									"handler": "proxy",
+									"upstreams": [
+										{
+											"dial": [
+												"10.0.0.20:554"
+											]
+										}
+									]
+								}
+							]
+						},
+						{
+							"match": [
+								{
+									"rtsp": {}
+								}
+							],
+							"handle": [
+								{
+									"handler": "proxy",
+									"upstreams": [
+										{
+											"dial": [
+												"10.0.0.99:554"
+											]
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}
