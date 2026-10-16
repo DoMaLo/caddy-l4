@@ -58,8 +58,9 @@ func (*MatchRTSP) CaddyModule() caddy.ModuleInfo {
 // Match returns true if the connection starts with an RTSP request that
 // satisfies the configured host filters.
 func (m *MatchRTSP) Match(cx *layer4.Connection) (bool, error) {
+	repl := cx.Replacer()
 	if host, ok := cx.GetVar(rtspHostVarName).(string); ok {
-		return m.hostMatches(host), nil
+		return m.hostMatches(host, repl), nil
 	}
 
 	data := cx.MatchingBytes()
@@ -75,12 +76,12 @@ func (m *MatchRTSP) Match(cx *layer4.Connection) (bool, error) {
 	}
 
 	cx.SetVar(rtspHostVarName, host)
-	cx.Replacer().Set(rtspHostReplKey, host)
-	return m.hostMatches(host), nil
+	repl.Set(rtspHostReplKey, host)
+	return m.hostMatches(host, repl), nil
 }
 
 // hostMatches reports whether host satisfies m.Host. An empty filter matches all.
-func (m *MatchRTSP) hostMatches(host string) bool {
+func (m *MatchRTSP) hostMatches(host string, repl *caddy.Replacer) bool {
 	if len(m.Host) == 0 {
 		return true
 	}
@@ -89,7 +90,10 @@ func (m *MatchRTSP) hostMatches(host string) bool {
 		return false
 	}
 	for _, pattern := range m.Host {
-		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if repl != nil {
+			pattern = repl.ReplaceAll(pattern, "")
+		}
+		pattern = strings.ToLower(stripPort(strings.TrimSpace(pattern)))
 		if pattern == "" {
 			continue
 		}
@@ -111,50 +115,95 @@ func (m *MatchRTSP) hostMatches(host string) bool {
 // parseRTSP inspects prefetched bytes.
 // needMore is true when more data is required to decide.
 func parseRTSP(data []byte) (needMore, isRTSP bool, host string) {
-	lineEnd := bytes.IndexByte(data, '\n')
-	if lineEnd < 0 {
-		return true, false, ""
+	line, headers, hasNewline := bytes.Cut(data, []byte{'\n'})
+	if !hasNewline {
+		return looksLikePartialRequestLine(data), false, ""
 	}
 
-	line := data[:lineEnd]
 	if len(line) > 0 && line[len(line)-1] == '\r' {
 		line = line[:len(line)-1]
 	}
 
 	// Request-Line = Method SP Request-URI SP RTSP-Version
-	method, rest, ok := cutByte(line, ' ')
-	if !ok || len(method) == 0 {
+	method, rest, ok := bytes.Cut(line, []byte{' '})
+	if !ok || !isValidMethod(method) {
 		return false, false, ""
 	}
-	uri, version, ok := cutByte(rest, ' ')
-	if !ok {
+	uri, version, ok := bytes.Cut(rest, []byte{' '})
+	if !ok || len(uri) == 0 {
 		return false, false, ""
 	}
-	if !bytes.HasPrefix(version, []byte("RTSP/")) {
-		return false, false, ""
-	}
-	ver := version[len("RTSP/"):]
-	if !bytes.Equal(ver, []byte("1.0")) && !bytes.Equal(ver, []byte("2.0")) {
+	if !bytes.Equal(version, []byte("RTSP/1.0")) && !bytes.Equal(version, []byte("RTSP/2.0")) {
 		return false, false, ""
 	}
 
 	// Always wait for the end of headers before a final decision. This lets
 	// Host override the URI authority, avoids accepting truncated header lines,
 	// and keeps bare `rtsp` catch-alls from matching while host routes prefetch.
-	headers := data[lineEnd+1:]
-	if !headersComplete(headers) {
+	hdrHost, hasHost, complete := parseHeaders(headers)
+	if !complete {
 		return true, true, ""
 	}
 
 	host = hostFromAbsoluteURI(string(uri))
-	if h, found := headerValue(headers, "host"); found {
-		host = h
+	if hasHost {
+		host = hdrHost
 	}
 	return false, true, host
 }
 
-func headersComplete(headers []byte) bool {
-	return bytes.Contains(headers, []byte("\r\n\r\n")) || bytes.Contains(headers, []byte("\n\n"))
+func isMethodChar(b byte) bool {
+	// RTSP methods use the HTTP token grammar (tchar).
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		strings.ContainsRune("!#$%&'*+-.^_`|~", rune(b))
+}
+
+func isValidMethod(method []byte) bool {
+	if len(method) == 0 {
+		return false
+	}
+	for _, b := range method {
+		if !isMethodChar(b) {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikePartialRequestLine reports whether an unterminated first line can
+// still become a valid RTSP request line once more bytes arrive.
+func looksLikePartialRequestLine(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	for i, b := range data {
+		if b == '\r' && i == len(data)-1 {
+			continue
+		}
+		if b < 0x20 || b >= 0x7f {
+			return false
+		}
+	}
+	method, rest, hasSpace := bytes.Cut(data, []byte{' '})
+	if !isValidMethod(method) {
+		return false
+	}
+	if !hasSpace {
+		return true
+	}
+	uri, version, hasSecondSpace := bytes.Cut(rest, []byte{' '})
+	if !hasSecondSpace {
+		return true
+	}
+	if len(uri) == 0 {
+		return false
+	}
+	if len(version) > 0 && version[len(version)-1] == '\r' {
+		version = version[:len(version)-1]
+	}
+	return bytes.HasPrefix([]byte("RTSP/1.0"), version) || bytes.HasPrefix([]byte("RTSP/2.0"), version)
 }
 
 func hostFromAbsoluteURI(raw string) string {
@@ -168,64 +217,56 @@ func hostFromAbsoluteURI(raw string) string {
 	return u.Host
 }
 
-// headerValue returns the value of the named header. Only complete lines
-// (terminated by \n) are considered; a trailing unterminated fragment is ignored.
-func headerValue(headers []byte, name string) (string, bool) {
-	name = strings.ToLower(name)
+// parseHeaders scans header lines until the terminating empty line (\r\n or \n).
+// Only complete lines (terminated by \n) are considered; a trailing unterminated
+// fragment means headers are not yet complete.
+func parseHeaders(headers []byte) (host string, hasHost, complete bool) {
 	for len(headers) > 0 {
-		eol := bytes.IndexByte(headers, '\n')
-		if eol < 0 {
-			// Incomplete trailing line — not a finished header.
-			return "", false
+		line, rest, ok := bytes.Cut(headers, []byte{'\n'})
+		if !ok {
+			// Incomplete trailing line — not a finished header block.
+			return "", false, false
 		}
-		line := headers[:eol]
-		headers = headers[eol+1:]
+		headers = rest
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
 		if len(line) == 0 {
-			return "", false
+			// Empty line marks the end of the headers section.
+			return host, hasHost, true
 		}
-		colon := bytes.IndexByte(line, ':')
-		if colon < 0 {
-			continue
+		if !hasHost {
+			if key, val, hasColon := bytes.Cut(line, []byte{':'}); hasColon {
+				if strings.EqualFold(string(bytes.TrimSpace(key)), "host") {
+					host = string(bytes.TrimSpace(val))
+					hasHost = true
+				}
+			}
 		}
-		key := strings.ToLower(string(bytes.TrimSpace(line[:colon])))
-		if key != name {
-			continue
-		}
-		return string(bytes.TrimSpace(line[colon+1:])), true
 	}
-	return "", false
-}
-
-func cutByte(b []byte, c byte) (before, after []byte, ok bool) {
-	i := bytes.IndexByte(b, c)
-	if i < 0 {
-		return nil, nil, false
-	}
-	return b[:i], b[i+1:], true
+	return "", false, false
 }
 
 func stripPort(hostport string) string {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
-		return hostport
+		return strings.Trim(hostport, "[]")
 	}
 	return host
 }
 
 // UnmarshalCaddyfile sets up the MatchRTSP from Caddyfile tokens. Syntax:
 //
-//	rtsp
 //	rtsp host <names...>
 //	rtsp {
 //		host <names...>
 //	}
+//	rtsp
 func (m *MatchRTSP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	_, wrapper := d.Next(), d.Val() // consume wrapper name
 
-	if d.NextArg() {
+	hasInlineArgs := d.NextArg()
+	if hasInlineArgs {
 		if d.Val() != "host" {
 			return d.ArgErr()
 		}
@@ -236,6 +277,9 @@ func (m *MatchRTSP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
+		if hasInlineArgs {
+			return d.Errf("malformed %s matcher: cannot combine inline arguments with a block", wrapper)
+		}
 		optionName := d.Val()
 		switch optionName {
 		case "host":
@@ -245,6 +289,10 @@ func (m *MatchRTSP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			m.Host = append(m.Host, d.RemainingArgs()...)
 		default:
 			return d.Errf("unknown %s option '%s'", wrapper, optionName)
+		}
+
+		if d.NextBlock(nesting + 1) {
+			return d.Errf("malformed %s option '%s': blocks are not supported", wrapper, optionName)
 		}
 	}
 

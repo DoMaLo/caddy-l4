@@ -1,3 +1,17 @@
+// Copyright 2020 Matthew Holt
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package l4rtsp
 
 import (
@@ -120,6 +134,8 @@ func TestMatchRTSP(t *testing.T) {
 	reqHostOverride := []byte("DESCRIBE rtsp://cam1.example.com/stream RTSP/1.0\r\n" +
 		"CSeq: 1\r\n" +
 		"Host: cam2.example.com\r\n\r\n")
+	reqNoHeaders := []byte("OPTIONS rtsp://cam1.example.com/stream RTSP/1.0\r\n\r\n")
+	reqExtensionMethod := []byte("VENDOR.METHOD rtsp://cam1.example.com/stream RTSP/1.0\r\n\r\n")
 
 	tests := []struct {
 		name     string
@@ -131,6 +147,18 @@ func TestMatchRTSP(t *testing.T) {
 			name:     "any-rtsp",
 			matchers: json.RawMessage(`{}`),
 			data:     reqCam1,
+			want:     true,
+		},
+		{
+			name:     "no-headers-request",
+			matchers: json.RawMessage(`{"host":["cam1.example.com"]}`),
+			data:     reqNoHeaders,
+			want:     true,
+		},
+		{
+			name:     "extension-method-token",
+			matchers: json.RawMessage(`{"host":["cam1.example.com"]}`),
+			data:     reqExtensionMethod,
 			want:     true,
 		},
 		{
@@ -214,8 +242,15 @@ func TestParseRTSPNeedMore(t *testing.T) {
 	if !needMore || !isRTSP || host != "" {
 		t.Fatalf("trunc: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
 	}
-	if h, found := headerValue([]byte("Host: cam"), "host"); found || h != "" {
-		t.Fatalf("headerValue on truncated line: found=%v host=%q", found, h)
+	if h, found, complete := parseHeaders([]byte("Host: cam")); found || complete || h != "" {
+		t.Fatalf("parseHeaders on truncated line: found=%v complete=%v host=%q", found, complete, h)
+	}
+
+	// Empty header block (\r\n\r\n right after request line) is complete.
+	noHeaders := []byte("OPTIONS * RTSP/1.0\r\n\r\n")
+	needMore, isRTSP, host = parseRTSP(noHeaders)
+	if needMore || !isRTSP || host != "" {
+		t.Fatalf("noHeaders: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
 	}
 
 	// Host overrides URI after headers are complete.
@@ -229,6 +264,23 @@ func TestParseRTSPNeedMore(t *testing.T) {
 	needMore, isRTSP, host = parseRTSP([]byte("DESCRIBE rtsp://cam"))
 	if !needMore || isRTSP || host != "" {
 		t.Fatalf("partial line: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
+	}
+
+	// Binary or non-RTSP prefix without newline is rejected immediately without waiting.
+	needMore, isRTSP, host = parseRTSP([]byte{0x16, 0x03, 0x01, 0x02, 0x00})
+	if needMore || isRTSP || host != "" {
+		t.Fatalf("tls bytes: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
+	}
+	needMore, isRTSP, host = parseRTSP([]byte("GET / HTTP/1.1"))
+	if needMore || isRTSP || host != "" {
+		t.Fatalf("partial http: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
+	}
+
+	// A partial extension method containing any valid token character must
+	// remain eligible until the request line can be decided.
+	needMore, isRTSP, host = parseRTSP([]byte("VENDOR.METHOD rtsp://cam"))
+	if !needMore || isRTSP || host != "" {
+		t.Fatalf("partial extension: needMore=%v isRTSP=%v host=%q", needMore, isRTSP, host)
 	}
 }
 
@@ -304,23 +356,61 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 			}
 		}
 	}
+
+	invalidInputs := []string{
+		`rtsp unknown cam1.example.com`,
+		`rtsp host`,
+		`rtsp {
+			host
+		}`,
+		`rtsp {
+			unknown cam1.example.com
+		}`,
+		`rtsp host cam1.example.com {
+			host cam2.example.com
+		}`,
+		`rtsp {
+			host cam1.example.com {
+				nested
+			}
+		}`,
+	}
+	for _, input := range invalidInputs {
+		d := caddyfile.NewTestDispenser(input)
+		m := &MatchRTSP{}
+		if err := m.UnmarshalCaddyfile(d); err == nil {
+			t.Fatalf("input %q: expected error, got nil", input)
+		}
+	}
 }
 
 func TestHostMatches(t *testing.T) {
-	m := &MatchRTSP{Host: []string{"Cam.Example.com", "*.labs.local"}}
-	if !m.hostMatches("cam.example.com") {
+	repl := caddy.NewReplacer()
+	repl.Set("custom_cam", "dyn.example.com")
+
+	m := &MatchRTSP{Host: []string{"Cam.Example.com", "*.labs.local", "[2001:db8::1]", "{custom_cam}"}}
+	if !m.hostMatches("cam.example.com", repl) {
 		t.Fatal("exact match failed")
 	}
-	if !m.hostMatches("cam.example.com:554") {
+	if !m.hostMatches("cam.example.com:554", repl) {
 		t.Fatal("match with port failed")
 	}
-	if !m.hostMatches("a.labs.local") {
+	if !m.hostMatches("a.labs.local", repl) {
 		t.Fatal("wildcard match failed")
 	}
-	if m.hostMatches("other.com") {
+	if !m.hostMatches("[2001:db8::1]:554", repl) {
+		t.Fatal("IPv6 with port match failed")
+	}
+	if !m.hostMatches("[2001:db8::1]", repl) {
+		t.Fatal("IPv6 without port match failed")
+	}
+	if !m.hostMatches("dyn.example.com", repl) {
+		t.Fatal("placeholder match failed")
+	}
+	if m.hostMatches("other.com", repl) {
 		t.Fatal("unexpected match")
 	}
-	if m.hostMatches("foo.labs.local.evil") {
+	if m.hostMatches("foo.labs.local.evil", repl) {
 		t.Fatal("suffix should not over-match trailing garbage")
 	}
 }

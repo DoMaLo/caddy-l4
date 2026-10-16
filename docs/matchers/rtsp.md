@@ -88,7 +88,7 @@ Example — route cameras by host on TCP port 554:
   `rtsp://` URI when both are present. This also keeps a bare `rtsp` catch-all
   from matching while host-specific routes are still prefetching headers.
 - Only the first request of the TCP connection is inspected (matching buffer).
-- Host matching is case-insensitive; ports in `Host` / URI authority are ignored.
+- Host matching is case-insensitive; ports in `Host` / URI authority are ignored. Runtime [placeholders](https://caddyserver.com/docs/conventions#placeholders) in `host` patterns are supported and evaluated at match time.
 - Wildcard form `*.example.com` matches `example.com` and any subdomain
   (`HasSuffix`); it does not match names like `foo.example.com.bar`.
 - Method filtering is not supported; any valid RTSP request line is accepted.
